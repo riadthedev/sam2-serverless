@@ -1,85 +1,80 @@
-# RunPod Video and Image Processor
+# RunPod SAM 2 Image Embedding Serverless
 
-This project is a serverless application using RunPod to process videos and single images using the SAM2 (Segment Anything Model 2) processor.
+Minimal RunPod Serverless worker that computes and returns SAM 2 image embeddings for client-side decoding.
 
 ## Features
-
-- Process videos using SAM2
-- Process single images using SAM2
-- Serverless architecture using RunPod
-
-## Dependencies
-- SAM2 
-- File uploader [bytescale](https://bytescale.com/) (API key BYTESCALE_API_KEY required) 
+- Returns full image embedding map (C×H×W) from SAM 2 image encoder.
+- Serialization as compressed `npz_base64` for compact transport.
+- Includes metadata for front-end coordinate mapping and decoding.
 
 ## Requirements
+- Python 3.10+
+- GPU on RunPod (recommended). CPU works but is slow.
 
-- Python 3.x
-- RunPod SDK
-
-## Installation
-
-1. Clone this repository
-2. Install the required dependencies:
-   ```
+## Install
+1. Install deps:
    pip install -r requirements.txt
-   ```
-3. Download the weights for SAM2 from the [official repository](https://github.com/IDEA-Research/SAM2)
-   ```
-   ./download_weights.sh
+2. Download SAM 2 checkpoints:
+   ./download_ckpts.sh
    mv *.pt checkpoints/
-   ```
-4. Set the BYTESCALE_API_KEY environment variable to your bytescale API key
 
 ## Usage
+The worker exposes a single action `embed_image` via RunPod Serverless.
 
-The main handler function in `runpod_handler.py` processes incoming events and routes them to the appropriate function based on the `action` parameter.
-
-To run the handler locally for testing, use the following command:
-
-```
-python runpod_handler.py
-```
-
-It will load the file test_input.json and process the event.
-
-### Processing a Video
-
-Send an event with the following structure:
-
-```json
+Input event (either image_b64 or input_image_url):
 {
   "input": {
-    "action": "process_video",
-    "video_url": "https://example.com/video.mp4",
-    "output_bucket": "my-output-bucket",
-    "output_key": "processed_video.mp4"
+    "action": "embed_image",
+    "image_b64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ...",  
+    "dtype": "float16",
+    "resize_longer_side": 1024
   }
 }
-```
 
-### Processing a Single Image
+or
 
-Send an event with the following structure:
-
-```json
 {
   "input": {
-    "action": "process_single_image",
-    // Add other required parameters for image processing
+    "action": "embed_image",
+    "input_image_url": "https://example.com/image.jpg",
+    "dtype": "float16",
+    "resize_longer_side": 1024
   }
 }
-```
 
-## File Structure
+Response (truncated):
+{
+  "type": "map",
+  "encoding": "npz_base64",
+  "data": "<base64 string>",
+  "shape": [256, 64, 64],
+  "dtype": "float16",
+  "meta": {
+    "model": "sam2_hiera_l.yaml",
+    "orig_size": [H_orig, W_orig],
+    "input_size": [1024, 1024],
+    "resized_size": [H_resized, W_resized],
+    "pad": [top, left, bottom, right],
+    "scale": {"h": s, "w": s},
+    "stride": 16
+  },
+  "device": "cuda",
+  "model": "sam2_hiera_large.pt"
+}
 
-- `runpod_handler.py`: Main handler for RunPod serverless functions
-- `sam2_processor.py`: Contains the `process_video` and `process_single_image` functions 
+Client: base64-decode and load the NPZ (key `embedding`) with NumPy to reconstruct `C×H×W`.
 
-## Contributing
+## Config
+- `SAM2_MODEL_CFG` (default `sam2_configs/sam2_hiera_l.yaml`)
+- `SAM2_CHECKPOINT` (default `./checkpoints/sam2_hiera_large.pt`)
+ - `PYTORCH_CUDA_ALLOC_CONF` (default set to `max_split_size_mb:128` in Dockerfile)
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+## Files
+- `runpod_handler.py` — RunPod handler wiring (action: `embed_image`).
+- `sam2_processor.py` — Model init and `embed_image` implementation.
+- `sam2_configs/` — Model YAML configs.
+- `download_ckpts.sh` — Helper to fetch checkpoints.
+- `test_input_embed.json` — Sample RunPod event.
 
 ## License
-
 MIT License

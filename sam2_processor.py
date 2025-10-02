@@ -1,137 +1,182 @@
 import os
-import torch
-import numpy as np
-import urllib.request
-import uuid
-import cv2
-import logging
+import io
 import base64
+import logging
+import numpy as np
 import requests
-from sam2.build_sam import build_sam2_video_predictor
+import torch
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.build_sam import build_sam2
 
-from tqdm import tqdm
-import runpod
-
-
-# Import the image processing functions
-from image_processing import (
-    show_points, apply_mask,
-    load_image_from_url, extract_frame_from_video, encode_image, upload_to_bytescale,
-    create_output_video, upload_video_to_bytescale, upload_video  # Add upload_video here
-)
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create the static directory if it doesn't exist
-os.makedirs('static', exist_ok=True)
 
-# Initialize the model
-logger.debug("Initializing the model...")
-torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+# Initialize the SAM 2 image model once
+MODEL_CFG = os.getenv("SAM2_MODEL_CFG", "sam2_configs/sam2_hiera_l.yaml")
+SAM2_CHECKPOINT = os.getenv("SAM2_CHECKPOINT", "./checkpoints/sam2_hiera_large.pt")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-sam2_checkpoint = "./checkpoints/sam2_hiera_large.pt"
-model_cfg = "sam2_hiera_l.yaml"
-
-predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
-logger.debug("Model initialized successfully.")
-
-sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
-image_predictor = SAM2ImagePredictor(sam2_model)
-
-def process_video(job):
-    job_input = job["input"]
-    session_id = job_input.get("session_id")
-    points = np.array(job_input["points"], dtype=np.float32)
-    labels = np.array(job_input["labels"], dtype=np.int32)
-    ann_frame_idx = job_input["ann_frame_idx"]
-    ann_obj_id = job_input["ann_obj_id"]
-    input_video_url = job_input.get("input_video_url")
-    mode = job_input.get("mode")
-    
-    # Validate that either session_id or input_video_url is provided
-    if session_id is None and input_video_url is None:
-        return {"error": "Either session_id or input_video_url must be provided"}
-    
-    # If both are provided, prioritize session_id
-    if session_id is not None and input_video_url is not None:
-        logger.warning("Both session_id and input_video_url provided. Using existing session.")
-        input_video_url = None
-        
-    if input_video_url:
-        upload_response = upload_video(input_video_url)
-        if "error" in upload_response:
-            return upload_response
-        session_id = upload_response["session_id"]
-    
-    video_dir = f"./temp_frames_{session_id}"
-    
-    if not os.path.exists(video_dir):
-        return {"error": "Invalid session ID"}
-
+if DEVICE == "cuda":
     try:
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-        # Load inference_state
-        
-        if os.environ.get('RUN_ENV') == 'production':
-            runpod.serverless.progress_update(job, f"Initializing inference state (1/3)")
-        inference_state = predictor.init_state(video_path=video_dir)
-    except FileNotFoundError:
-        return {"error": "Inference state not found. Please upload the video first."}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        pass
 
-    # scan all the JPEG frame names in this directory
-    frame_names = [
-        p for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+logger.info(f"Loading SAM2 model on {DEVICE} with cfg {MODEL_CFG}")
+sam2_model = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE)
+image_predictor = SAM2ImagePredictor(sam2_model)
 
-    # Check if ann_frame_idx is valid
-    if ann_frame_idx < 0 or ann_frame_idx >= len(frame_names):
-        return {"error": f"Invalid ann_frame_idx. Must be between 0 and {len(frame_names) - 1}"}
 
-    _, out_obj_ids, out_mask_logits = predictor.add_new_points(
-        inference_state=inference_state,
-        frame_idx=ann_frame_idx,
-        obj_id=ann_obj_id,
-        points=points,
-        labels=labels,
-    )
+def _serialize_npz_base64(arr: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    # Use compressed NPZ to reduce payload size
+    np.savez_compressed(buffer, embedding=arr)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode('utf-8')
 
-    # run propagation throughout the video and collect the results in a dict
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-        if os.environ.get('RUN_ENV') == 'production':
-            runpod.serverless.progress_update(job, f"Segment update {out_frame_idx}/{len(frame_names)} (2/3)")
+def embed_image(job):
+    """
+    Compute and return the SAM 2 image embedding for a single image.
 
-    # Create output videos
-    output_video_path = create_output_video(job, session_id, frame_names, video_dir, video_segments, mode)
+    Input (job["input"]):
+      - input_image_url: URL to the image (preferred)
+      - or input_video_url + ann_frame_idx: extract a frame first
+      - dtype: "float16" (default) or "float32" for the returned embedding
+      - resize_longer_side: default 1024 (metadata; predictor handles its own transforms)
 
-    # Upload video to Bytescale API
+    Output:
+      JSON with keys: type, encoding, data (npz base64), shape, dtype, meta, timing_ms, device, model
+    """
+    job_input = job.get("input", {})
+    image_url = job_input.get("input_image_url")
+    image_b64 = job_input.get("image_b64")
+    video_url = job_input.get("input_video_url")
+    frame_index = job_input.get("ann_frame_idx")
+    out_dtype = str(job_input.get("dtype", "float16")).lower()
+    resize_longer_side = int(job_input.get("resize_longer_side", 1024))
+
+    if not (image_b64 or image_url or (video_url and frame_index is not None)):
+        return {"error": "Missing image_b64 or input_image_url (or input_video_url with ann_frame_idx)"}
+    if out_dtype not in ("float16", "float32"):
+        return {"error": f"Unsupported dtype: {out_dtype}"}
+
+    # Load image (RGB np array); prefer base64 if provided
     try:
-        bytescale_video_url = upload_video_to_bytescale(output_video_path)
+        if image_b64:
+            b64_str = image_b64
+            if "," in b64_str and b64_str.strip().startswith("data:"):
+                # data URL pattern: data:image/png;base64,<payload>
+                b64_str = b64_str.split(",", 1)[1]
+            raw = base64.b64decode(b64_str, validate=True)
+            from PIL import Image
+            from io import BytesIO
+            pil_img = Image.open(BytesIO(raw)).convert("RGB")
+            image = np.array(pil_img)
+        elif video_url and frame_index is not None:
+            # Not supported in embeddings-only build
+            return {"error": "input_video_url/frame extraction not supported in embeddings-only build"}
+        else:
+            resp = requests.get(image_url, timeout=20)
+            resp.raise_for_status()
+            from PIL import Image
+            from io import BytesIO
+            pil_img = Image.open(BytesIO(resp.content)).convert("RGB")
+            image = np.array(pil_img)
     except Exception as e:
-        return {"error": f"Failed to upload video to Bytescale: {str(e)}"}
+        return {"error": f"Failed to load image: {str(e)}"}
+
+    orig_h, orig_w = int(image.shape[0]), int(image.shape[1])
+
+    # Run predictor to compute (and cache) image embedding
+    try:
+        image_predictor.set_image(image)
+    except Exception as e:
+        return {"error": f"Failed to set image for predictor: {str(e)}"}
+
+    # Try multiple ways to access the image embedding robustly
+    emb_tensor = None
+    try:
+        if hasattr(image_predictor, "get_image_embedding"):
+            emb_tensor = image_predictor.get_image_embedding()
+        elif hasattr(image_predictor, "get_image_embeddings"):
+            emb_tensor = image_predictor.get_image_embeddings()
+        elif hasattr(image_predictor, "features"):
+            feats = getattr(image_predictor, "features")
+            # Common keys seen in predictors
+            for key in ("image_embed", "image_embeddings", "image_embedding", "features"):
+                if isinstance(feats, dict) and key in feats:
+                    emb_tensor = feats[key]
+                    break
+    except Exception:
+        # fallthrough to error below if nothing is set
+        emb_tensor = None
+
+    if emb_tensor is None:
+        return {"error": "Could not retrieve image embedding from predictor. Ensure SAM2 version supports get_image_embedding()."}
+
+    # Move to CPU and convert dtype
+    try:
+        emb = emb_tensor.detach().to("cpu")
+        # Remove batch dim if present: (1, C, H, W) -> (C, H, W)
+        if emb.ndim == 4 and emb.shape[0] == 1:
+            emb = emb[0]
+        elif emb.ndim == 3:
+            pass
+        else:
+            # Unexpected shape, try to squeeze
+            emb = emb.squeeze()
+
+        if out_dtype == "float16":
+            emb = emb.to(torch.float16)
+        else:
+            emb = emb.to(torch.float32)
+
+        emb_np = emb.numpy()
+    except Exception as e:
+        return {"error": f"Failed to finalize embedding tensor: {str(e)}"}
+
+    # Compute deterministic resize/pad metadata assuming 1024 pipeline
+    longer = max(orig_h, orig_w)
+    scale = resize_longer_side / float(longer)
+    resized_h = int(round(orig_h * scale))
+    resized_w = int(round(orig_w * scale))
+    pad_top = 0
+    pad_left = 0
+    pad_bottom = max(0, resize_longer_side - resized_h)
+    pad_right = max(0, resize_longer_side - resized_w)
+
+    # Heuristic stride; most SAM2 image encoders downsample by 16
+    stride = 16
+
+    try:
+        data_b64 = _serialize_npz_base64(emb_np)
+    except Exception as e:
+        return {"error": f"Failed to serialize embedding: {str(e)}"}
+
+    meta = {
+        "model": os.path.basename(MODEL_CFG),
+        "orig_size": [orig_h, orig_w],
+        "input_size": [resize_longer_side, resize_longer_side],
+        "resized_size": [resized_h, resized_w],
+        "pad": [pad_top, pad_left, pad_bottom, pad_right],
+        "scale": {"h": scale, "w": scale},
+        "stride": stride,
+    }
 
     return {
-        "output_video_url": bytescale_video_url,
-        "session_id": session_id,
+        "type": "map",
+        "encoding": "npz_base64",
+        "data": data_b64,
+        "shape": list(emb_np.shape),
+        "dtype": out_dtype,
+        "meta": meta,
+        "device": DEVICE,
+        "model": os.path.basename(SAM2_CHECKPOINT),
     }
     
 def process_single_image(job):

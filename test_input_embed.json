@@ -1,0 +1,9 @@
+{
+  "input": {
+    "action": "embed_image",
+    "input_image_url": "https://upcdn.io/FW25b7k/raw/uploads/test.jpg",
+    "dtype": "float16",
+    "resize_longer_side": 1024
+  }
+}
+
