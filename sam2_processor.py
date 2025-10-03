@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 # Initialize the SAM 2 image model once
-MODEL_CFG = os.getenv("SAM2_MODEL_CFG", "/app/sam2_configs/sam2_hiera_l.yaml")  # Changed to absolute path
-SAM2_CHECKPOINT = os.getenv("SAM2_CHECKPOINT", "/app/checkpoints/sam2_hiera_large.pt")  # Changed to absolute path
+MODEL_CFG = os.getenv("SAM2_MODEL_CFG", "sam2_hiera_l")
+SAM2_CHECKPOINT = os.getenv("SAM2_CHECKPOINT", "/app/checkpoints/sam2_hiera_large.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 if DEVICE == "cuda":
