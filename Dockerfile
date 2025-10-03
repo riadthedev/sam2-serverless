@@ -19,11 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && find /opt/conda -name "*.pyc" -delete \
     && find /opt/conda -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
-# Clone SAM2 repo to get config files
-RUN git clone https://github.com/facebookresearch/segment-anything-2.git /tmp/sam2 \
-    && cp -r /tmp/sam2/sam2_configs /app/sam2_configs \
-    && rm -rf /tmp/sam2
-
 ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
@@ -38,6 +33,7 @@ RUN bash ./download_ckpts.sh \
     && mv *.pt checkpoints/ \
     && rm -f download_ckpts.sh
 
+# Copy everything (including sam2_configs folder from your repo)
 COPY . /app
 
 CMD ["python", "runpod_handler.py"]
