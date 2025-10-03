@@ -25,15 +25,12 @@ ENV MKL_NUM_THREADS=1
 
 RUN mkdir -p checkpoints
 
-COPY download_ckpts.sh /app/
-RUN chmod +x download_ckpts.sh
+# Copy everything (including sam2_configs folder from your repo)
+COPY . /app
 
 # Download checkpoint and clean up
 RUN bash ./download_ckpts.sh \
     && mv *.pt checkpoints/ \
     && rm -f download_ckpts.sh
-
-# Copy everything (including sam2_configs folder from your repo)
-COPY . /app
 
 CMD ["python", "runpod_handler.py"]
